@@ -3,9 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
+	//"io"
+	"io/ioutil"
+	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"time"
@@ -24,7 +29,7 @@ import (
 )
 
 type Downloader interface {
-	Download(ctx context.Context, feedConfig *config.Feed, episode *model.Episode) (io.ReadCloser, error)
+	Download(ctx context.Context, feedConfig *config.Feed, episode *model.Episode) (*ytdl.TempFile, error)
 }
 
 type Updater struct {
@@ -257,8 +262,60 @@ func (u *Updater) downloadEpisodes(ctx context.Context, feedConfig *config.Feed)
 			return err
 		}
 
+		type Segment struct {
+			Segment  []float64 `json:"segment"`
+			UUID     string
+			Category string `json:"category"`
+		}
+
+		var segments []Segment
+
+		// Do sponsorblock stuffs
+		timeSincePosted := time.Since(episode.PubDate)
+		delayPassed := timeSincePosted.Microseconds() > feedConfig.SponsorblockDelay.Microseconds()
+
+		logger.Debugf("SponsorblockMode is %s", feedConfig.SponsorblockMode)
+		if feedConfig.SponsorblockMode == "delay" && !delayPassed {
+			logger.Info("Sponsorblock mode is delay and configured delay has not passed yet: Skipping download of this episode and segments query for now")
+		}
+
+		if feedConfig.SponsorblockMode != "off" {
+			url := u.config.SponsorBlock.ApiUrl + fmt.Sprintf("/api/skipSegments?categories=[\"sponsor\",\"intro\",\"outro\",\"interaction\",\"selfpromo\",\"music_offtopic\"]&videoID=%s", episode.ID)
+			logger.Debugf("Grabbing url %s", url)
+			resp, err := http.Get(url)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == 404 {
+					logger.Info("No sponsor segments available yet")
+				} else if resp.StatusCode == 200 {
+					data, err := ioutil.ReadAll(resp.Body)
+					if err != nil {
+						logger.WithError(err).Error("Failed reading body of sponsorblock response")
+					} else {
+						logger.Debugf("Sponsorblock responded with json %#v", string(data))
+						if err := json.Unmarshal(data, &segments); err != nil {
+							logger.WithError(err).Error("Failed parsing json")
+						}
+					}
+				} else {
+					logger.WithError(err).Errorf("Sponsorblock server returned unexpected error %d", resp.StatusCode)
+				}
+			} else {
+				logger.WithError(err).Warn("failed to retrieve sponsor segments from sponsorblock server")
+			}
+		}
+
+		if feedConfig.SponsorblockMode == "require" && len(segments) == 0 {
+			logger.Info("Sponsorblock mode is require and zero segments have been found: Skipping download of this episode for now")
+			continue
+		}
+		if feedConfig.SponsorblockMode == "requiredelay" && len(segments) == 0 && !delayPassed {
+			logger.Info("Sponsorblock mode is requiredelay, zero segments have been found, and configured delay has not passed yet: Skipping download of this episode for now")
+			continue
+		}
+
 		// Download episode to disk
-		// We download the episode to a temp directory first to avoid downloading this file by clients
+		// We download the episode to a temp directory first to avoid clients downloading this file
 		// while still being processed by youtube-dl (e.g. a file is being downloaded from YT or encoding in progress)
 
 		logger.Infof("! downloading episode %s", episode.VideoURL)
@@ -282,12 +339,145 @@ func (u *Updater) downloadEpisodes(ctx context.Context, feedConfig *config.Feed)
 			continue
 		}
 
-		logger.Debug("copying file")
-		fileSize, err := u.fs.Create(ctx, feedID, episodeName, tempFile)
-		tempFile.Close()
-		if err != nil {
-			logger.WithError(err).Error("failed to copy file")
-			return err
+		var fileSize int64
+		logger.Debugf("Segments from sponsorblock: %#v", segments)
+		if len(segments) == 0 {
+			logger.Debug("copying file")
+			var err error
+			fileSize, err = u.fs.Create(ctx, feedID, episodeName, tempFile)
+			tempFile.Close()
+			if err != nil {
+				logger.WithError(err).Error("failed to copy file")
+				return err
+			}
+		} else {
+			logger.Debug("in file is %#v", tempFile)
+			// time.Sleep(time.Duration(10) * time.Minute)
+			// Time to get trimmin'
+
+			// First, use the list of segments (time ranges to drop) to make a list of "keeps" (time ranges to keep)
+			var keeps [][2]float64
+			c := feedConfig.SponsorBlockCategories
+			nextStart := 0.0
+			for _, segment := range segments {
+				if segment.Category == "sponsor" && c.Sponsors == "keep" {
+					continue
+				}
+				if segment.Category == "intro" && c.Intermissions == "keep" {
+					continue
+				}
+				if segment.Category == "outro" && c.Endcards == "keep" {
+					continue
+				}
+				if segment.Category == "interaction" && c.InteractionReminders == "keep" {
+					continue
+				}
+				if segment.Category == "selfpromo" && c.SelfPromotions == "keep" {
+					continue
+				}
+				if segment.Category == "music_offtopic" && c.NonmusicSections == "keep" {
+					continue
+				}
+				keeps = append(keeps, [2]float64{nextStart, segment.Segment[0]})
+				nextStart = segment.Segment[1]
+			}
+			keeps = append(keeps, [2]float64{nextStart, -1})
+			logger.Debugf("'Keep' segments are %#v", keeps)
+
+			tmpDir, err := ioutil.TempDir("", "podsync-ffmpeg-")
+			if err != nil {
+				return errors.Wrap(err, "failed to get temp dir for ffmpeg")
+			}
+			// defer func() {
+			// 	if err != nil {
+			// 		err1 := os.RemoveAll(tmpDir)
+			// 		if err1 != nil {
+			// 			log.Errorf("could not remove temp dir: %v", err1)
+			// 		}
+			// 	}
+			// }()
+
+			ext := "mp4"
+			videoStreams := 1
+			if feedConfig.Format == model.FormatAudio {
+				ext = "mp3"
+				videoStreams = 0
+			}
+
+			//var segmentFiles []string
+			var filter string
+			var finalFilter string
+			for idx, segment := range keeps {
+				// [0:v]trim=start=0:end=30,setpts=PTS-STARTPTS[s1v];[0:a]atrim=start=0:end=30,asetpts=PTS-STARTPTS[s1a];
+				start, end := segment[0], segment[1]
+				filter += fmt.Sprintf("[0:a]atrim=start=%f", start)
+				if end >= 0 {
+					filter += fmt.Sprintf(":end=%f", end)
+				}
+				filter += fmt.Sprintf(",asetpts=PTS-STARTPTS[s%da];", idx)
+				if feedConfig.Format != model.FormatAudio {
+					filter += fmt.Sprintf("[0:v]trim=start=%f", start)
+					if end >= 0 {
+						filter += fmt.Sprintf(":end=%f", end)
+					}
+					filter += fmt.Sprintf(",setpts=PTS-STARTPTS[s%dv];", idx)
+					finalFilter += fmt.Sprintf("[s%dv]", idx)
+				}
+				finalFilter += fmt.Sprintf("[s%da]", idx)
+				/*filePath := filepath.Join(tmpDir, fmt.Sprintf("%d.%s", idx, ext))
+				ctx := exec.Command("ffmpeg", "-ss", fmt.Sprintf("%f", start), "-t", fmt.Sprintf("%f", end-start), "-i", tempFile.FullPath(), filePath)
+				err := ctx.Run()
+				if err != nil {
+					return errors.Wrap(err, "Failed trying to run ffmpeg command")
+				}
+				segmentFiles = append(segmentFiles, filePath)*/
+			}
+			filter += finalFilter + fmt.Sprintf("concat=n=%d:v=%d:a=1", len(keeps), videoStreams)
+			if feedConfig.Format != model.FormatAudio {
+				filter += "[outv]"
+			}
+			filter += "[outa]"
+			processedPath := filepath.Join(tmpDir, fmt.Sprintf("processed-%s.%s", episode.ID, ext))
+			args := []string{"-f", ext, "-i", tempFile.Fullpath(), "-filter_complex", filter, "-map", "[outa]"}
+			if feedConfig.Format != model.FormatAudio {
+				args = append(args, "-map", "[outv]")
+			}
+			args = append(args, processedPath)
+			logger.Debugf("Calling ffmpeg with args %#v", args)
+			cmd := exec.Command("ffmpeg", args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			//cmd.Stdin = tempFile.File
+			// pipe, err := cmd.StdinPipe()
+			// if err != nil {
+			// 	return errors.Wrap(err, "Error running ffmpeg")
+			// }
+			//err = cmd.Run()
+			err = cmd.Start()
+			if err != nil {
+				return errors.Wrap(err, "Error running ffmpeg")
+			}
+			//_, err2 := io.Copy(pipe, tempFile.File)
+			err = cmd.Wait()
+			tempFile.Close()
+			//logger.Debug("ffmpeg stdout", cmd.S)
+			if err != nil {
+				return errors.Wrap(err, "Error running ffmpeg")
+			}
+			// if err2 != nil {
+			// 	return errors.Wrap(err2, "Error running ffmpeg")
+			// }
+
+			logger.Debug("copying cut file %s", processedPath)
+			tempFileProcessed, err := os.Open(processedPath)
+			if err == nil {
+				fileSize, err = u.fs.Create(ctx, feedID, episodeName, tempFileProcessed)
+			}
+			tempFile.Close()
+			if err != nil {
+				logger.WithError(err).Error("failed to copy file")
+				return err
+			}
 		}
 
 		// Update file status in database
